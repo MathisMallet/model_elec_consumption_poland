@@ -1,0 +1,161 @@
+---
+title: "model_conso_elec_poland"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-01-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# To do : make sure data ordered by year ? order.by = data$Year, tho I think it is.
+
+# Modèle de la consomation d'électricité en Pologne
+
+## Libraires
+```{r}
+library(openxlsx)
+library(tidyverse)
+library(data.table)   
+library(e1071)
+library(lmtest)
+library(sandwich)
+library(nlme)
+library(dynlm)
+```
+
+## Importation des données
+
+```{r}
+data_path = "Elec_Poland.xlsx"
+raw_data = read.xlsx(
+  data_path,
+  sheet = "Data"
+)
+```
+
+```{r}
+colnames(raw_data)
+```
+
+```{r}
+data <- copy(raw_data)
+data <- data %>% 
+  mutate(C_elec_by_pop = Elec_cons / Population) %>%
+  mutate(Real_GDP_per_cap = PIB / CPI / Population) %>%
+  mutate(Real_Elec_P = P_elec / CPI) %>%
+  mutate(ln_C_elec_by_pop = log(C_elec_by_pop)) %>%
+  mutate(ln_Real_GDP_per_cap = log(Real_GDP_per_cap)) %>%
+  mutate(ln_Real_Elec_P = log(Real_Elec_P))
+data <- data[-nrow(data), ]
+```
+
+## Model
+
+```{r}
+model <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+  data = data
+)
+
+summary(model)
+```
+Tous les indicateurs sont au vert ! Peut-être ajuster en enlevant à l'avance la dernière année incomplète.
+
+## Analyse des résidus
+Une estimastion des moindres carrés ordinaires est non biaisée seulement si les hypothèses sur les résidus sont vérifiées.
+
+### Normalité des résidus
+
+Théorie :
+La normalité est nécessaire pour : 
+- Des t-tests valides
+- Des F-tests valides lorsqu'il y a peu d'échantillons
+
+Tests:
+- Graphique: QQ-plot
+- Statistique: Shapiro-Wilk / Jarque-Bera
+
+```{r}
+res <- residuals(model)
+
+qqnorm(res)
+qqline(res, col = "red")
+
+mean(res)
+skewness(res)
+kurtosis(res)
+
+shapiro.test(res)
+```
+On observe sur le qq plot des quantiles relativement bien alignés avec la courbe théorique, suggérant une distribution proche de la loi normale. On note que l'asymétrie est faible (-0.39), avec un léger excès de kurtosis (1.41) qui indique des queues plus épaisses que pour une distribution normale.
+De plus le test de Shapiro-Wilk donne une p-value d'environ 11% qui ne permet pas de rejeter l'hypothèse selon laquelle les résidus suivent une distribution normale au seuil de 5%.
+Il est alors raisonnable d'admettre valide l'hypothèse selon laquelles les résidus suivent une distribution normale.
+
+Si l'on souhaite s'assurer toutefois d'avoir des t-tests et F-tests valides (car nos données ne sont pas asymptotiquement nombreuses), on peut utiliser les erreurs robustes standards qui corrige la non-normalité et l'hétéroscédasticité :
+
+```{r}
+coeftest(model, vcov = vcovHC(model, type = "HC1"))
+```
+Tous est bon ici aussi (seuil 5%) et pas de grosse différence. On peut donc rester sur les résultats d'avant.
+
+### Autocorrélation des résidus
+Si il y a de l'autocorrélation des résidus, l'estimation des moindres carrés reste sans biais mais est inefficace et fausse les erreurs standards des coefficients et biaise les tests (t-tests et F-tests) avec des intervalles de confiance trop étroits. Il y a donc un risque de faux-positif (variable faussement considérée comme significative).
+```{r}
+dwtest(model)
+pacf(res)
+Box.test(res, lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
+plot(model, which = 1)  # Résidus vs valeurs ajustées, pas d'infos évidentes
+```
+Le test de Durbin-Watson donne une valeur DW = 1.07 (<1.5) avec une p-value = 0.0005 (<5%) ce qui nous permet de rejeter l'hypothèse delon laquelle l'autocorrélation des résidus est nulle. Par ailleur la valeur DW = 1.07 (<2) indique une autocorrélation positive.
+Le graphe de l'autocorrélation partielle indique une autocorrélation particulièrement importante pour un lag de 1, ce que le test Box-Pierce confirme avec une p-value de 0.12 (<5%) qui permet de rejeter l'hypothèse selon laquelle les résidus sont indépendant avec un lag de 1. (Attention la validité de tt ces tests est encore à vérifier)
+
+
+Cela peut être corrigé de plusieurs manières :
+- Faire un modèle OLS avec autocorrélation (Cochrane-Orcutt)
+- Faire un modèle autorégressif, ici l'autocorrélation est particulièrement élever pour un lag de 1, un modèle AR(1) pourrait donc être adapté.
+- Utiliser d'autres modèles dynamiques comme ARIMA (avec moyenne mobile) ou modèles à effets fixes (pas pertinent ici)
+- Ajouter des variables (omises) qui pourraient expliquer cette tendance temporelle (on en discuté l'autre jour, à voir, je pense que c'est la première option à envisager).
+- Erreurs standards de Newey-West: calcul des erreurs standards robustes à l'autocorrélation et à l'hétéroscédasticité.(Pareil qu'avant ?? je ne crois pqs)
+
+#### Newey-West
+Le prewhitening (ou "blanchiment") est une technique utilisée dans l’estimation des matrices de variance-covariance robustes (comme celle de Newey-West) pour améliorer la précision des corrections d’autocorrélation. Pour cela il y a un ajustement d'un modèle AR(p=2 ici) sur les résidus. Particulièrement pertinente dans notre cas car nous avons une autocorrélation marquée et un petit échantillon. Lag à 2 uniquement car petit échantillon. (ça peut suffir, car petit échantillon et autocorrélation légère, réellement?)
+```{r}
+coeftest(model, vcov = NeweyWest(model, lag = 2, prewhite = TRUE))
+```
+Bon signe, les erreurs standards sont légèrement plus élevées mais les coefficients ont toujours une influence significative.
+
+#### Cochrane-Orcutt
+AR permets d'avoir les coefficients de lags et de les interprétés, Cochrane-Orcutt modifie directement les coefficient du modèle (sans lag) pour les corriger de l'autocorrélation (pas ouf ?)
+```{r}
+model_co <- gls(ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+                data = data,
+                correlation = corAR1(form = ~ Year))
+summary(model_co)
+```
+
+#### AR2
+```{r}
+model_ar2 <- dynlm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + L(ln_C_elec_by_pop, 3),
+  data = data
+  )
+summary(model_ar2)
+```
+```{r}
+library(tseries)
+adf.test(data[, "ln_C_elec_by_pop"])
+#Pas sationnaire
+```
+```{r}
+plot(data$Year, data$ln_C_elec_by_pop)
+```
+
+AR2 à expliquer, y a des trucs que je ne comprends pas mais peut-être une erreur numérique. Car les résultats tendent à montrer un série stationnaire, ce qui n'est pas le cas.
+
+#### Ajout de variables liée à une évolution temporelle (To do)
+
+### Hétéroscédasticité
+
+
