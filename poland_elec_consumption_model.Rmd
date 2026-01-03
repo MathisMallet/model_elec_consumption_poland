@@ -10,6 +10,10 @@ date: "2026-01-02"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 # To do : make sure data ordered by year ? order.by = data$Year, tho I think it is.
+Prendre en compte le prix des autres sources d'énergie en compétition avec l'électricité
+Prendre en compte le l'influence du mix énergétique sur le coût de l'électricité.
+Gérer la multicolinéarité introduite avec le lag ?
+Créer une fonction qui vient effectuer tous les tests pour un model et l'utiliser.
 
 # Modèle de la consomation d'électricité en Pologne
 
@@ -23,32 +27,37 @@ library(lmtest)
 library(sandwich)
 library(nlme)
 library(dynlm)
+library(corrplot)
+library(car)
+library(VisCollin)
+library(glmnet)
+library(strucchange)
 ```
 
 ## Importation des données
 
 ```{r}
-data_path = "Elec_Poland.xlsx"
-raw_data = read.xlsx(
-  data_path,
+df_path = "Elec_Poland.xlsx"
+raw_df = read.xlsx(
+  df_path,
   sheet = "Data"
 )
 ```
 
 ```{r}
-colnames(raw_data)
+colnames(raw_df)
 ```
 
 ```{r}
-data <- copy(raw_data)
-data <- data %>% 
+df <- copy(raw_df)
+df <- df %>% 
   mutate(C_elec_by_pop = Elec_cons / Population) %>%
   mutate(Real_GDP_per_cap = PIB / CPI / Population) %>%
   mutate(Real_Elec_P = P_elec / CPI) %>%
   mutate(ln_C_elec_by_pop = log(C_elec_by_pop)) %>%
   mutate(ln_Real_GDP_per_cap = log(Real_GDP_per_cap)) %>%
   mutate(ln_Real_Elec_P = log(Real_Elec_P))
-data <- data[-nrow(data), ]
+df <- df[-nrow(df), ]
 ```
 
 ## Model
@@ -56,7 +65,7 @@ data <- data[-nrow(data), ]
 ```{r}
 model <- lm(
   ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
-  data = data
+  data = df
 )
 
 summary(model)
@@ -109,7 +118,7 @@ Box.test(res, lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
 plot(model, which = 1)  # Résidus vs valeurs ajustées, pas d'infos évidentes
 ```
 Le test de Durbin-Watson donne une valeur DW = 1.07 (<1.5) avec une p-value = 0.0005 (<5%) ce qui nous permet de rejeter l'hypothèse delon laquelle l'autocorrélation des résidus est nulle. Par ailleur la valeur DW = 1.07 (<2) indique une autocorrélation positive.
-Le graphe de l'autocorrélation partielle indique une autocorrélation particulièrement importante pour un lag de 1, ce que le test Box-Pierce confirme avec une p-value de 0.12 (<5%) qui permet de rejeter l'hypothèse selon laquelle les résidus sont indépendant avec un lag de 1. (Attention la validité de tt ces tests est encore à vérifier)
+Le graphe de l'autocorrélation partielle indique une autocorrélation particulièrement importante pour un lag de 1, ce que le test Box-Pierce confirme avec une p-value de 0.012 (<5%) qui permet de rejeter l'hypothèse selon laquelle les résidus sont indépendant avec un lag de 1. (Attention la validité de tt ces tests est encore à vérifier)
 
 
 Cela peut être corrigé de plusieurs manières :
@@ -130,32 +139,275 @@ Bon signe, les erreurs standards sont légèrement plus élevées mais les coeff
 AR permets d'avoir les coefficients de lags et de les interprétés, Cochrane-Orcutt modifie directement les coefficient du modèle (sans lag) pour les corriger de l'autocorrélation (pas ouf ?)
 ```{r}
 model_co <- gls(ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
-                data = data,
+                data = df,
                 correlation = corAR1(form = ~ Year))
 summary(model_co)
 ```
-
-#### AR2
 ```{r}
-model_ar2 <- dynlm(
-  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + L(ln_C_elec_by_pop, 3),
-  data = data
+res_co <- residuals(model_co)
+
+qqnorm(res_co)
+qqline(res_co, col = "red")
+
+mean(res_co)
+skewness(res_co)
+kurtosis(res_co)
+
+shapiro.test(res_co)
+```
+```{r}
+#dwtest(model_co)
+pacf(res_co)
+Box.test(res_co, lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
+plot(model, which = 1)
+```
+ça ne s'améliore pas du tt, c'est comme si le modèle était le même.
+#### AR1 
+```{r}
+model_ar1 <- dynlm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + L(ln_C_elec_by_pop, 1),
+  data = df
   )
-summary(model_ar2)
+summary(model_ar1)
+plot(model_ar1, which = 1)
 ```
 ```{r}
 library(tseries)
-adf.test(data[, "ln_C_elec_by_pop"])
+adf.test(df[, "ln_C_elec_by_pop"])
 #Pas sationnaire
 ```
+
+AR1 pas fou car : la série n'est pas stationnaire (test de Dickey-Fuller), ajouter un lag implique donc que ce lag porte toute la tendance temporelle de cette série, ce qui fausse notre raisonnement économétrique de causalité. En résumé, ce modèle perd beaucoup de son intérêt. (INTERPRETATION A VERIFIER)
+
+#AR1 MAIS QUI MARCHE
 ```{r}
-plot(data$Year, data$ln_C_elec_by_pop)
+# Add a lagged variable (you will lose 1 observation, n=33)
+df <- df %>% mutate(lag_Y = lag(ln_C_elec_by_pop))
+
+model_dynamic <- lm(ln_C_elec_by_pop ~ lag_Y + ln_Real_GDP_per_cap + ln_Real_Elec_P, data = df)
+summary(model_dynamic)
+# Check autocorrelation
+dwtest(model_dynamic)
+```
+```{r}
+dwtest(model_dynamic)
+pacf(residuals(model_dynamic))
+Box.test(residuals(model_dynamic), lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
+plot(model_dynamic, which = 1)  # Résidus vs valeurs ajustées, pas d'infos évidentes
 ```
 
-AR2 à expliquer, y a des trucs que je ne comprends pas mais peut-être une erreur numérique. Car les résultats tendent à montrer un série stationnaire, ce qui n'est pas le cas.
 
-#### Ajout de variables liée à une évolution temporelle (To do)
+Une solution possible est de modéliser la différentielle de notre série temporelle.
+
+```{r}
+df_diff <- df[-1, ] 
+df_diff$d_ln_C_elec_by_pop <- diff(df$ln_C_elec_by_pop)
+df_diff$d_ln_Real_GDP_per_cap <- diff(df$ln_Real_GDP_per_cap)
+df_diff$d_ln_Real_Elec_P <- diff(df$ln_Real_Elec_P)
+model_diff <- dynlm(
+  d_ln_C_elec_by_pop ~ d_ln_Real_GDP_per_cap + d_ln_Real_Elec_P,
+  data = df_diff
+)
+summary(model_diff)
+```
+
+```{r}
+dwtest(model_diff)
+pacf(residuals(model_diff))
+Box.test(residuals(model_diff), lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
+plot(model_diff, which = 1)  # Résidus vs valeurs ajustées, pas d'infos évidentes
+```
+Avec le modèle différentié, plus d'autocorrélation mais des résultat de modèle pas terribles (perte d'une observable sur 34 et perte de l'information de niveau).
+
+#### Ajout de variables liée à une évolution temporelle (To do later)
+
+#### Conclusion autocorrélation
+Newey-West permet de dire que les t-tests et les F-tests reste correcte lorsque l'échantillon est corrigé de l'autotcorrélation. Les autres méthodes ne semble pas satisfaisantes pour le moment. Rest à réaliser aussi un ajout de certaines variables liées au temps (années ?, investissement dans de l'électrique (voir batiments cf données IEA))
 
 ### Hétéroscédasticité
 
+Important pour la validité des tests.
+Ici on tests si le carré des résidus est lié aux variables explicatives (ou à leurs carrés aussi).
+```{r}
+bptest(model)
+bptest(model, ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + 
+         I(ln_Real_GDP_per_cap^2) + I(ln_Real_Elec_P^2),
+       data = df)
+```
+Des p-value qui ne rejette pas l'hypothèse l'homoscédasticité même sous un seuil de 10% ! On est tt bon !
+
+## Multicolinéarité des variables explicatives
+
+### Corrélation
+Si on a une forte corrélation entre les varibales explicatives, la variance des estimateurs est accrue.
+
+```{r}
+correlation <- cor(df[, c("ln_Real_GDP_per_cap", "ln_Real_Elec_P")])
+corrplot(cor(df[, c("ln_Real_GDP_per_cap", "ln_Real_Elec_P")]))
+correlation
+```
+ça à l'air plutôt ok !
+
+### VIF
+
+```{r}
+vif(model)
+```
+Les deux VIF sont de l'ordre de 1 ce qui montre presque aucune colinéarité entre nos variables explicatives.
+
+### Belsley, Kuh, and Welsch (1980) et diagnostique de colinéarité (pas sûr de la fiabilité et peut-être excessif)
+```{r}
+colldiag(model)
+```
+Le plus gros indexe de condition est 3.4 << 30. Donc pas de prb de collinéarité, mais j'ai pas vraiment compris cette méthode donc à supprimer?
+
+### Solutions (inutile dans notre cas)
+#### Régression de Ridge
+
+```{r}
+X <- model.matrix(model)[, -1]
+y <- df$ln_C_elec_by_pop
+
+ridge <- glmnet(X, y, alpha = 0) #pas sûr de ce que signifie l'alpha
+summary(ridge) #pas sûr de comprendre non plus
+```
+#### Régression en composante principale (ça je maîtrise très bieeenn)
+```{r}
+pca <- prcomp(X, scale. = TRUE)
+summary(pca) #Là c'est juste la PCA, mais on peut régresser à partir des variables PC1 et PC2
+```
+## Stabilité Temporelle
+
+### CUSUM
+Pour détecter des changement de tendances structurelles sans les connaîtres
+```{r}
+cusum <- efp(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+  data = df,
+  type = "OLS-CUSUM"
+)
+
+plot(cusum)
+sctest(cusum, type = "CUSUM") #(vérifier l'usage)
+```
+Test de CUSUM ne permet pas de rejeter l'hypothèse de coefficients stables au cours du temps (courbe à l'intérieur des bornes de confiance au seuil de 5%). Il n'y a donc pas de changement structurel au cours du temps.
+
+On extrait toutefois les max et min :
+```{r}
+cusum_values <- as.numeric(cusum$process)
+cusum_max <- max(cusum_values)
+cusum_min <- min(cusum_values)
+cusum_time <- time(cusum$process)
+idx_max <- which.max(cusum_values)
+idx_min <- which.min(cusum_values)
+year_ratio_max <- cusum_time[idx_max]
+year_ratio_min <- cusum_time[idx_min]
+year_ratio_max
+year_ratio_min
+year_converter <- function(year_ratio, df){
+    round((max(df$Year)-min(df$Year))*year_ratio, digits=0) + min(df$Year)
+}
+
+year_converter(year_ratio_min, df)
+year_converter(year_ratio_max, df)
+which(df$Year==year_converter(year_ratio_min, df))
+which(df$Year==year_converter(year_ratio_max, df))
+```
+
+
+###CUSUMQ
+Teste la stabilité dans le temps de la variance.
+```{r}
+cusumsq <- efp(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+  data = df,
+  type = "OLS-MOSUM"
+)
+
+plot(cusumsq)
+sctest(cusumsq, type = "MOSUM")
+```
+Idem, stabilité temporelle de la variance (un peu moindre).
+
+On extrait le Min
+```{r}
+cusumsq_values <- as.numeric(cusumsq$process)
+cusumsq_min <- min(cusum_values)
+cusumsq_time <- time(cusumsq$process)
+idx_min <- which.min(cusumsq_values)
+year_ratio_min <- cusumsq_time[idx_min]
+year_ratio_min
+
+year_converter(year_ratio_min, df)
+```
+
+### Test de Chow
+Test s'il y a un changement de coefficient après une date donnée.
+```{r}
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 26
+)
+
+print(chow_result)
+```
+
+```{r}
+fs <- Fstats(
+ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+data = df
+)
+plot(fs)
+```
+mauvaise nouvelle,  le test de Chow indique des rupture de tendance un peu partout (sauf tardivement)!!!
+
+Le plateu haut et mauvais signe et indique une non-stationarité ou un modèle mauvais presque partout ?
+
+## Modèle dynamique 
+
+### Stabilité temporelle
+
+```{r}
+cusum <- efp(
+  ln_C_elec_by_pop ~ lag_Y + ln_Real_GDP_per_cap + ln_Real_Elec_P,
+  data = df,
+  type = "OLS-CUSUM"
+)
+
+plot(cusum)
+sctest(cusum, type = "CUSUM") #(vérifier l'usage)
+#model_dynamic
+```
+```{r}
+fs <- Fstats(
+ln_C_elec_by_pop ~ lag_Y + ln_Real_GDP_per_cap + ln_Real_Elec_P,
+data = df
+)
+plot(fs)
+```
+
+```{r}
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ lag_Y + ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 8
+)
+
+print(chow_result)
+```
+##ARDL (Autoregressive Distributed Lag) Pas ouf ici
+```{r}
+model_ARDL <- lm(ln_C_elec_by_pop ~ 
+                  lag(ln_C_elec_by_pop) + 
+                  ln_Real_GDP_per_cap + 
+                  lag(ln_Real_GDP_per_cap) + 
+                  ln_Real_Elec_P +
+                  lag(ln_Real_Elec_P), 
+                data = df)
+
+summary(model_ARDL)
+```
 
