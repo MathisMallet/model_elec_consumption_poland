@@ -15,6 +15,10 @@ Prendre en compte le l'influence du mix énergétique sur le coût de l'électri
 Gérer la multicolinéarité introduite avec le lag ?
 Créer une fonction qui vient effectuer tous les tests pour un model et l'utiliser.
 
+MAJ :
+Voir si variable tendancielle suffisante 
+Implémenter Ridge et PCA
+
 # Modèle de la consomation d'électricité en Pologne
 
 ## Libraires
@@ -32,6 +36,7 @@ library(car)
 library(VisCollin)
 library(glmnet)
 library(strucchange)
+library(pls)
 ```
 
 ## Importation des données
@@ -398,6 +403,90 @@ chow_result <- sctest(
 
 print(chow_result)
 ```
+
+## Multicolinéarité des variables explicatives
+
+### Corrélation
+Si on a une forte corrélation entre les varibales explicatives, la variance des estimateurs est accrue.
+
+```{r}
+df_lag <- df[-1,]
+correlation <- cor(df_lag[, c("lag_Y","ln_Real_GDP_per_cap", "ln_Real_Elec_P")])
+corrplot(cor(df_lag[, c("lag_Y","ln_Real_GDP_per_cap", "ln_Real_Elec_P")]))
+correlation
+```
+ça à l'air plutôt ok !
+
+### VIF
+
+```{r}
+vif(model_dynamic)
+```
+
+### Belsley, Kuh, and Welsch (1980) et diagnostique de colinéarité (pas sûr de la fiabilité et peut-être excessif)
+```{r}
+colldiag(model_dynamic)
+```
+Le plus gros indexe de condition est 30.7 ~ 30. Donc prb de collinéarité.
+
+### Solutions 
+#### Régression de Ridge
+
+```{r}
+X <- model.matrix(model_dynamic)[, -1]
+y <- df_lag$ln_C_elec_by_pop
+
+# Setting the range of lambda values
+lambda_seq <- 10^seq(2, -5, by = -.1)
+
+ridge <- glmnet(X, y, alpha = 0, lambda = lambda_seq) #pas sûr de ce que signifie l'alpha
+summary(ridge) #pas sûr de comprendre non plus
+```
+```{r}
+# Using cross validation glmnet
+ridge_cv <- cv.glmnet(X, y, alpha = 0, lambda = lambda_seq)
+# Best lambda value
+best_lambda <- ridge_cv$lambda.min
+best_lambda
+```
+
+```{r}
+#best_fit <- ridge_cv$glmnet.fit
+#head(best_fit)
+best_ridge <- glmnet(X, y, alpha = 0, lambda = 0.001258925)
+coef(best_ridge)
+```
+
+#### Régression en composante principale 
+```{r}
+#make this example reproducible
+set.seed(1)
+
+#fit PCR model
+model <- pcr(ln_C_elec_by_pop ~ lag_Y + ln_Real_GDP_per_cap + ln_Real_Elec_P
+               , data=df_lag, scale=TRUE, validation="CV")
+
+summary(model)
+validationplot(model)
+validationplot(model, val.type="MSEP")
+validationplot(model, val.type="R2")
+```
+#### TEMP
+```{r}
+#define training and testing sets
+train <- mtcars[1:25, c("hp", "mpg", "disp", "drat", "wt", "qsec")]
+y_test <- mtcars[26:nrow(mtcars), c("hp")]
+test <- mtcars[26:nrow(mtcars), c("mpg", "disp", "drat", "wt", "qsec")]
+    
+#use model to make predictions on a test set
+model <- pcr(hp~mpg+disp+drat+wt+qsec, data=train, scale=TRUE, validation="CV")
+pcr_pred <- predict(model, test, ncomp=2)
+
+#calculate RMSE
+sqrt(mean((pcr_pred - y_test)^2))
+```
+
+
 ##ARDL (Autoregressive Distributed Lag) Pas ouf ici
 ```{r}
 model_ARDL <- lm(ln_C_elec_by_pop ~ 
@@ -409,5 +498,217 @@ model_ARDL <- lm(ln_C_elec_by_pop ~
                 data = df)
 
 summary(model_ARDL)
+```
+
+## Bootstrap ?
+
+```{r}
+library(boot)
+
+# Function to obtain R-squared
+rsq <- function(formula, data, indices) {
+  d <- data[indices, ]      # bootstrap sample
+  fit <- lm(formula, data = d)
+  return(summary(fit)$r.squared)
+}
+
+# Run bootstrapping with 1000 replications
+results <- boot(
+  data = df_lag,
+  statistic = rsq,
+  R = 1000,
+  formula = ln_C_elec_by_pop ~ lag_Y + ln_Real_GDP_per_cap + ln_Real_Elec_P
+)
+
+# View results
+results
+
+# Plot bootstrap distribution
+plot(results)
+
+# 95% confidence interval (BCa)
+boot.ci(results, type = "bca")
+```
+
+#### Trajectories
+
+On peut faire plusieur trajectoires jusqu'à 2050, ici on proposera (tt les euro en réel):
+- croissance de 3% du PIB (https://economy-finance.ec.europa.eu/economic-surveillance-eu-member-states/country-pages/poland/economic-forecast-poland_en)
+- hard transition : prix de l'électricité + 5%/an pendant 10 ans (https://www.forum-energii.eu/en/download/download/transformacja-energetyczna-polski-edycja-2025) (pas vraiment d'info prix source)
+- slow transition : prix de l'électricité + 2% jusqu'en 2050
+- Chock des prix : + 100% en 2025
+- Crise : PIB réel -10%
+- Décroissance : -1% à partir de 2030
+- Same as usual :  économie stable (prix elec, croissance +3%), autres tendances linéraires
+
+
+```{r}
+plot(df_lag$Year, df_lag$PIB)
+plot(df_lag$Year, df_lag$Population)
+plot(df_lag$Year, df_lag$CPI)
+plot(df_lag$Year, df_lag$P_elec)
+
+plot(df_lag$Year, df_lag$ln_Real_GDP_per_cap)
+plot(df_lag$Year, df_lag$ln_Real_Elec_P)
+```
+```{r}
+df_traj_stable <- df_lag
+for (year in c(2024:2050)){
+  last_row <- tail(df_traj_stable, n=1)
+  last_row <- last_row %>% mutate(across(
+    .cols = -c(ln_Real_GDP_per_cap, ln_Real_Elec_P),
+    .fns  = ~ NaN
+  ))
+  last_row$Year = year 
+  last_row$ln_Real_GDP_per_cap = last_row$ln_Real_GDP_per_cap + log(1.03)
+  last_row$ln_Real_Elec_P = last_row$ln_Real_Elec_P #useless line but explicit
+  df_traj_stable <- rbind(df_traj_stable, last_row)
+}
+
+#df_traj_stable <- filter(df_traj_stable, Year > 2023)
+  
+```
+
+
+
+```{r}
+boot_path <- function(data, indices, traj, Y0) {
+  
+  d <- data[indices, ]
+  
+  fit <- lm(
+    ln_C_elec_by_pop ~ lag_Y + ln_Real_GDP_per_cap + ln_Real_Elec_P,
+    data = d
+  )
+  
+  beta <- coef(fit)
+  H <- nrow(traj)
+  
+  Y_hat <- numeric(H)
+  Y_prev <- Y0
+  
+  for (h in 1:H) {
+    Y_hat[h] <-
+      beta[1] +
+      beta["lag_Y"] * Y_prev +
+      beta["ln_Real_GDP_per_cap"] * traj$ln_Real_GDP_per_cap[h] +
+      beta["ln_Real_Elec_P"] * traj$ln_Real_Elec_P[h]
+    
+    Y_prev <- Y_hat[h]  # update lag
+  }
+  
+  return(Y_hat)
+}
+
+```
+
+```{r}
+Y0 <- tail(df_lag$ln_C_elec_by_pop, 1)
+
+set.seed(46)
+
+boot_results <- boot(
+  data = df_lag,
+  statistic = boot_path,
+  R = 1000,
+  traj = df_traj_stable,
+  Y0 = Y0
+)
+
+```
+
+```{r}
+proj_ci <- apply(
+  boot_results$t,
+  2,
+  quantile,
+  probs = c(0.01, 0.5, 0.99)
+)
+
+proj_ci <- t(proj_ci)
+colnames(proj_ci) <- c("lower", "median", "upper")
+```
+
+```{r}
+H <- nrow(df_traj_stable)
+
+plot(
+  1:H, proj_ci[, "median"],
+  type = "l",
+  lwd = 2,
+  ylim = range(proj_ci),
+  xlab = "Horizon",
+  ylab = "ln(C_elec_by_pop)",
+  main = "Bootstrap Dynamic Projection"
+)
+
+polygon(
+  c(1:H, rev(1:H)),
+  c(proj_ci[, "lower"], rev(proj_ci[, "upper"])),
+  col = rgb(0, 0, 1, 0.2),
+  border = NA
+)
+
+```
+```{r}
+real_y = df_lag$ln_C_elec_by_pop
+real_H = length(real_y)
+H <- nrow(df_traj_stable)
+
+ylim_all <- range(
+  proj_ci[, c("lower", "upper")],
+  real_y,
+  na.rm = TRUE
+)
+
+plot(
+  1:H, proj_ci[, "median"],
+  type = "n",                     # set up canvas first
+  ylim = ylim_all,
+  xlab = "Horizon",
+  ylab = "ln(C_elec_by_pop)",
+  main = "Bootstrap Dynamic Projection with Real Data"
+)
+
+# Fan chart (confidence band)
+polygon(
+  c(1:H, rev(1:H)),
+  c(proj_ci[, "lower"], rev(proj_ci[, "upper"])),
+  col = rgb(0.2, 0.4, 0.8, 0.25),
+  border = NA
+)
+
+# Median projection
+lines(
+  1:H, proj_ci[, "median"],
+  lwd = 2,
+  col = "blue"
+)
+
+# Real observed data
+lines(
+  1:real_H, real_y,
+  lwd = 2,
+  col = "black",
+  lty = 1
+)
+
+# Optional: points for real data
+points(
+  1:real_H, real_y,
+  pch = 16,
+  cex = 0.7,
+  col = "black"
+)
+
+# Legend
+legend(
+  "topleft",
+  legend = c("Median projection", "90% CI", "Observed data"),
+  lwd = c(2, NA, 2),
+  pch = c(NA, 15, 16),
+  col = c("blue", rgb(0.2, 0.4, 0.8, 0.25), "black"),
+  bty = "n"
+)
 ```
 
