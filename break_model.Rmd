@@ -1,0 +1,565 @@
+---
+title: "model_conso_elec_poland"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-01-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# To do : make sure data ordered by year ? order.by = data$Year, tho I think it is.
+Prendre en compte le prix des autres sources d'énergie en compétition avec l'électricité
+Prendre en compte le l'influence du mix énergétique sur le coût de l'électricité.
+Gérer la multicolinéarité introduite avec le lag ?
+Créer une fonction qui vient effectuer tous les tests pour un model et l'utiliser.
+
+MAJ :
+Voir si variable tendancielle suffisante 
+Implémenter Ridge et PCA
+
+# Modèle de la consomation d'électricité en Pologne
+
+## Libraires
+```{r}
+library(openxlsx)
+library(tidyverse)
+library(data.table)   
+library(e1071)
+library(lmtest)
+library(sandwich)
+library(nlme)
+library(dynlm)
+library(corrplot)
+library(car)
+library(VisCollin)
+library(glmnet)
+library(strucchange)
+library(pls)
+library(aTSA)
+```
+
+## Importation des données
+
+```{r}
+df_path = "Elec_Poland.xlsx"
+raw_df = read.xlsx(
+  df_path,
+  sheet = "Data"
+)
+```
+
+## Transformation des données
+```{r}
+colnames(raw_df)
+```
+
+```{r}
+df <- copy(raw_df)
+df <- df %>% 
+  mutate(C_elec_by_pop = Elec_cons,
+  Real_GDP_per_cap = PIB / CPI / Population,
+  Real_Elec_P = P_elec / CPI,
+  ln_C_elec_by_pop = log(C_elec_by_pop),
+  ln_Real_GDP_per_cap = log(Real_GDP_per_cap),
+  ln_Real_Elec_P = log(Real_Elec_P*10), 
+  ln_Year = log(Year),
+  lag_ln_C_elec_by_pop = lag(ln_C_elec_by_pop))
+df <- df[-nrow(df), ]
+
+summary(df)
+```
+
+
+```{r}
+df_diff <- copy(df[-1,])
+df_diff$diff_C_elec_by_pop <- diff(df$C_elec_by_pop)
+df_diff$diff_Real_GDP_per_cap <- diff(df$Real_GDP_per_cap)
+df_diff$diff_Real_Elec_P <- diff(df$Real_Elec_P)
+
+summary(df_diff)
+```
+
+## plot data
+```{r}
+plot(x = df$Year, y= df$C_elec_by_pop)
+plot(x = df$Year, y= df$Real_GDP_per_cap)
+plot(x = df$Year, y= df$ln_Real_Elec_P)
+plot(x = df_diff$Year, y= df_diff$diff_C_elec_by_pop )
+plot(x = df_diff$Year, y= df_diff$diff_Real_GDP_per_cap)
+plot(x = df_diff$Year, y= df_diff$diff_Real_Elec_P)
+```
+
+
+## Models
+
+```{r}
+model <- lm(
+  C_elec_by_pop ~ Real_GDP_per_cap + Real_Elec_P,
+  data = df
+)
+
+summary(model)
+
+model_ln <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+  data = df
+)
+
+summary(model_ln)
+
+model_diff <- lm(
+  diff_C_elec_by_pop ~ diff_Real_GDP_per_cap + diff_Real_Elec_P,
+  data = df_diff
+)
+
+summary(model_diff)
+
+model_lag <- lm(
+  ln_C_elec_by_pop ~
+    lag_ln_C_elec_by_pop +
+    ln_Real_GDP_per_cap +
+    ln_Real_Elec_P,
+  data = df
+)
+
+summary(model_lag)
+
+model_trend <- lm(
+  ln_C_elec_by_pop ~
+    ln_Year +
+    ln_Real_GDP_per_cap +
+    ln_Real_Elec_P,
+  data = df
+)
+
+summary(model_trend)
+```
+
+Aucun des modèles ne fonctionne particulièrement bien, de plus on observe pas le comportement attendu de la variable prix. En regardant les variation, on observe une rupture de tendance, on teste donc pour la stabilité temporelle.
+
+
+### Test de stationnarité
+
+```{r}
+adf.test(df$ln_C_elec_by_pop)
+adf.test(df$ln_Real_GDP_per_cap)
+adf.test(df$ln_Real_Elec_P)
+
+```
+Askip ça permet de savoir si on ajoute un lag ou une trend mais bon déjà testé et pas ouf.
+
+### Stabilité Temporelle
+
+#### CUSUM
+Pour détecter des changement de tendances structurelles sans les connaîtres
+```{r}
+cusum <- efp(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P ,
+  data = df,
+  type = "Rec-CUSUM"
+)
+
+plot(cusum)
+sctest(cusum, type = "CUSUM") 
+```
+Test de CUSUM ne permet pas de rejeter l'hypothèse de coefficients stables au cours du temps (courbe à l'intérieur des bornes de confiance au seuil de 5%).
+
+
+####CUSUMQ
+Teste la stabilité dans le temps de la variance.
+J'ai pas réussi à bien l'implémenter, reprendre le code du prof.
+
+#### Test de Chow
+Test s'il y a un changement de coefficient après une date donnée.
+
+
+```{r}
+fs <- Fstats(
+ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+data = df
+)
+plot(fs)
+sctest(fs)
+```
+```{r}
+0.62*(2023-1990) + 1990
+```
+On regardant les donnée on va tester pour la rupture sur un petit évantail, on s'attend à ce qu'elle se produise en 2009.
+
+```{r}
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 18 #2007
+)
+print("2007")
+print(chow_result)
+
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 19 #2008
+)
+print("2008")
+print(chow_result)
+
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 20 #2009
+)
+print("2009")
+print(chow_result)
+
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 21 #2010
+)
+print("2010")
+print(chow_result)
+
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 22 #2011
+)
+print("2011")
+print(chow_result)
+
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 23 #2012
+)
+print("2012")
+print(chow_result)
+
+chow_result <- sctest(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P, 
+  data = df, 
+  type = "Chow", 
+  point = 24 #2013
+)
+print("2013")
+print(chow_result)
+```
+
+Rupture dès 2009 avec une p-value de 0.7%.
+(Aussi valable pour 2010 et 2011)
+
+## Structural change
+### Create a dummy
+```{r}
+df <- df %>% mutate(past_2009 = ifelse(df$Year > 2009, 1, 0))
+
+df_diff <- df_diff %>% mutate(past_2009 = ifelse(df_diff$Year > 2009, 1, 0))
+```
+
+### Models + dummy
+
+```{r}
+model <- lm(
+  C_elec_by_pop ~ Real_GDP_per_cap + Real_Elec_P + past_2009,
+  data = df
+)
+
+summary(model)
+
+model_ln <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + past_2009,
+  data = df
+)
+
+summary(model_ln)
+
+model_diff <- lm(
+  diff_C_elec_by_pop ~ diff_Real_GDP_per_cap + diff_Real_Elec_P + past_2009,
+  data = df_diff
+)
+
+summary(model_diff)
+
+model_lag <- lm(
+  ln_C_elec_by_pop ~
+    lag_ln_C_elec_by_pop +
+    ln_Real_GDP_per_cap +
+    ln_Real_Elec_P +
+    past_2009,
+  data = df
+)
+
+summary(model_lag)
+
+model_trend <- lm(
+  ln_C_elec_by_pop ~
+    ln_Year +
+    ln_Real_GDP_per_cap +
+    ln_Real_Elec_P +
+    past_2009,
+  data = df
+)
+
+summary(model_trend)
+```
+L'influence du prix de l'élec ne fait tj pas sens, sinon la dummy semble bien marcher, reste à la tester dans d'autres conigurations.
+
+### Models * dummy
+
+```{r}
+model <- lm(
+  C_elec_by_pop ~ Real_GDP_per_cap + Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(model)
+
+model_ln <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(model_ln)
+
+model_diff <- lm(
+  diff_C_elec_by_pop ~ diff_Real_GDP_per_cap + diff_Real_Elec_P*past_2009,
+  data = df_diff
+)
+
+summary(model_diff)
+
+model_lag <- lm(
+  ln_C_elec_by_pop ~
+    lag_ln_C_elec_by_pop +
+    ln_Real_GDP_per_cap +
+    ln_Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(model_lag)
+
+model_trend <- lm(
+  ln_C_elec_by_pop ~
+    ln_Year +
+    ln_Real_GDP_per_cap +
+    ln_Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(model_trend)
+```
+Le deuxième modèle, loglin est clairement le plus prometteur et commence à donner de l'info. Dans la suis on va se concentrer sur ce dernier.
+
+### Loglin model and dummy
+
+```{r}
+
+model_ln <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + past_2009,
+  data = df
+)
+
+summary(model_ln)
+
+model_ln_2 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(model_ln_2)
+
+model_ln_3 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap*past_2009 + ln_Real_Elec_P,
+  data = df
+)
+
+summary(model_ln_3)
+
+model_ln_4 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap*past_2009 + ln_Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(model_ln_4)
+
+```
+Le deuxième modèle semble le meilleur, essayons de le comprendre :
+### Best model
+```{r}
+model <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(model)
+```
+Influence positive du revenu OK
+Effet fixe de 2009-2010 à prendre en compte avec la modif de l'effet prix.
+Effet prix positif avant 2009
+Effet prix négatif après 2009
+Que s'est-il passé en 2009 ?
+En 2008, libéralisation du marché de l'électricité. Pour les industries et les commerces dérégulation dès 2008. Les prix pour les ménages ont continué d'être régulés par l'URE. Projet de déréguler dès 2009 pour les ménages si suffisament de compétition sur le marché (pas le cas). Projet abandonné?
+
+Aussi le prix qu'on a est lequel ? Parce qu'on dirait que ça n'est pas le prix de l'élec pour les ménages mais bien pour les entreprises comme il semble se dérégulé après 2009.
+
+Mon analyse : avant 2009, la rédulation des prix rend le signal prix faible : pas de variation rapide des prix donc pas d'optimisation par les entreprises sur le prix de l'électricité. L'impact positif des prix sur la consommation est alors un problème d'endogénéité : si le prix augmente la consommation c'est plutôt parce qu'une hausse de la conso => hausse de la demande => besoin de plus d'offre/inciter à moins consomé => hausse des prix de l'élec par le régulateur (à vérifier dans les rapport comment sont justifiées les hausse si possible)
+
+Après 2009 : dérégulation pour les entreprises donc signal prix plus important et optimisation de la consommation.(explication pas forcément valable à la résolution annuelle). Rupture de l'effet d'endogénéité par l'introduction d'une concurence (endogénéité qui pouvait cammoufler l'effet prix par le passé).
+
+On corrige pour l'endogénéité en enlevant l'effet prix avant 2009 :
+
+```{r}
+model_past_2009 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + past_2009 + ln_Real_Elec_P:past_2009,
+  data = df
+)
+
+summary(model_past_2009)
+```
+ça ne marche pas très bien pour montrer l'effet prix, on conserve le précédent modèle par la suite même si il y a une possible endogénéité.
+
+## Analyse des résidus
+Une estimastion des moindres carrés ordinaires est non biaisée seulement si les hypothèses sur les résidus sont vérifiées.
+
+### Normalité des résidus
+
+Théorie :
+La normalité est nécessaire pour : 
+- Des t-tests valides
+- Des F-tests valides lorsqu'il y a peu d'échantillons
+
+Tests:
+- Graphique: QQ-plot
+- Statistique: Shapiro-Wilk / Jarque-Bera
+
+```{r}
+res <- residuals(model)
+
+qqnorm(res)
+qqline(res, col = "red")
+
+mean(res)
+skewness(res)
+kurtosis(res)
+
+shapiro.test(res)
+```
+Le test de Shapiro-Wilk donne une p-value d'environ 98% qui ne permet pas de rejeter l'hypothèse selon laquelle les résidus suivent une distribution normale au seuil de 5%. OK
+
+
+On peut utiliser les erreurs robustes standards qui corrige la non-normalité et l'hétéroscédasticité (pas nécessaire)
+
+```{r}
+coeftest(model, vcov = vcovHC(model, type = "HC1"))
+```
+Cela améliore les résultats
+
+### Autocorrélation des résidus
+Si il y a de l'autocorrélation des résidus, l'estimation des moindres carrés reste sans biais mais est inefficace et fausse les erreurs standards des coefficients et biaise les tests (t-tests et F-tests) avec des intervalles de confiance trop étroits. Il y a donc un risque de faux-positif (variable faussement considérée comme significative).
+```{r}
+dwtest(model)
+pacf(res)
+Box.test(res, lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
+plot(model, which = 1)  # Résidus vs valeurs ajustées, pas d'infos évidentes
+```
+On peut conserver l'hypothèse delon laquelle l'autocorrélation des résidus est nulle au seuil de 5% (pvalue sur DW 5.5% OUF)
+
+
+```{r}
+acf(residuals(model))
+```
+
+
+### Hétéroscédasticité
+
+Important pour la validité des tests.
+Ici on tests si le carré des résidus est lié aux variables explicatives (ou à leurs carrés aussi).
+```{r}
+bptest(model)
+bptest(model, ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + 
+         I(ln_Real_GDP_per_cap^2) + I(ln_Real_Elec_P^2),
+       data = df)
+```
+Des p-value qui ne rejette pas l'hypothèse l'homoscédasticité même sous un seuil de 10% ! On est tt bon !
+
+## Multicolinéarité des variables explicatives
+
+### Corrélation
+Si on a une forte corrélation entre les varibales explicatives, la variance des estimateurs est accrue.
+
+```{r}
+df <- df[-1,]
+correlation <- cor(df[, c("ln_Real_GDP_per_cap", "ln_Real_Elec_P", "past_2009")])
+corrplot(cor(df[, c("ln_Real_GDP_per_cap", "ln_Real_Elec_P", "past_2009")]))
+correlation
+```
+
+### VIF
+
+```{r}
+vif(model)
+
+vif(model, type = "predictor")
+```
+Pas de forte colinéarité pour ln_Real_GDP_per_cap et ln_Real_Elec_P (<5).
+La collinéarité importante entre les variables d'intéraction fait sens.
+En calculant le VIF généralisé, on retrouve en effet que les corrélations sont acceptables.
+
+
+### Solutions à la multicolinéarité (inutiles dans notre cas)
+#### Régression de Ridge
+
+```{r}
+# Make sure the model matrix uses the same cleaned data as your y
+df_clean <- na.omit(df[, c("ln_C_elec_by_pop", "ln_Real_GDP_per_cap", "ln_Real_Elec_P", "past_2009")])
+
+X <- model.matrix(ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P * past_2009, data = df_clean)[, -1]
+y <- df_clean$ln_C_elec_by_pop
+
+# Check dimensions
+dim(X)       # should be 33 x p
+length(y)    # should be 33
+
+```
+
+
+```{r}
+
+ridge <- glmnet(X, y, alpha = 0) #alpha = 0 pour ridge (vers 1 c'est lasso)
+summary(ridge) 
+plot(ridge, xvar = "lambda", label = TRUE)
+```
+#### Régression en composante principale
+```{r}
+# Install if needed
+# install.packages("pls")
+library(pls)
+
+# PCR: regress ln_C_elec_by_pop on predictors
+pcr_model <- pcr(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P*past_2009,
+  data = df_clean,
+  scale = TRUE,   # standardize predictors
+  validation = "CV"  # cross-validation to choose # of components
+)
+
+# Summary
+summary(pcr_model)
+
+
+# Choose optimal number of components using CV
+validationplot(pcr_model, val.type = "MSEP")  # mean squared error
+
+```
+
+## Bootstrap
+
+
