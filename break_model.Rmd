@@ -9,15 +9,11 @@ date: "2026-01-02"
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
-# To do : make sure data ordered by year ? order.by = data$Year, tho I think it is.
-Prendre en compte le prix des autres sources d'énergie en compétition avec l'électricité
-Prendre en compte le l'influence du mix énergétique sur le coût de l'électricité.
-Gérer la multicolinéarité introduite avec le lag ?
-Créer une fonction qui vient effectuer tous les tests pour un model et l'utiliser.
+# To do : 
 
-MAJ :
-Voir si variable tendancielle suffisante 
-Implémenter Ridge et PCA
+ajout de variable : indice de temp
+
+Model prix elec réel <- prix_elec_passé + prop ENR + régulation type ETS ?
 
 # Modèle de la consomation d'électricité en Pologne
 
@@ -50,7 +46,26 @@ raw_df = read.xlsx(
 )
 ```
 
+```{r}
+df_T_path = "avg_mean_temp.csv"
+df_T_raw = read.csv(df_T_path)
+```
+
+
 ## Transformation des données
+```{r}
+summary(df_T_raw)
+```
+
+
+```{r}
+df_T <- df_T_raw %>% 
+  rename_at("Category", ~"Year") %>%
+  rename_at("Average.Mean.Surface.Air.Temperature...C.", ~"avg_mean_T") %>%
+  mutate(ln_avg_mean_T = log(avg_mean_T))
+```
+
+
 ```{r}
 colnames(raw_df)
 ```
@@ -60,16 +75,40 @@ df <- copy(raw_df)
 df <- df %>% 
   mutate(C_elec_by_pop = Elec_cons,
   Real_GDP_per_cap = PIB / CPI / Population,
+  P_elec = P_elec*10,
+  ln_P_elec = log(P_elec),
   Real_Elec_P = P_elec / CPI,
   ln_C_elec_by_pop = log(C_elec_by_pop),
   ln_Real_GDP_per_cap = log(Real_GDP_per_cap),
-  ln_Real_Elec_P = log(Real_Elec_P*10), 
+  ln_Real_Elec_P = log(Real_Elec_P), 
   ln_Year = log(Year),
   lag_ln_C_elec_by_pop = lag(ln_C_elec_by_pop))
 df <- df[-nrow(df), ]
 
 summary(df)
 ```
+
+### Create a dummy
+```{r}
+df <- df %>% mutate(past_2009 = ifelse(df$Year > 2009, 1, 0),
+                    prev_2009 = ifelse(df$Year > 2009, 0, 1)
+                    )
+```
+
+### Ajout des variable prix scindées
+
+```{r}
+df <- df %>% mutate(
+  N_ln_P_elec_prev_2009 = ln_P_elec*prev_2009,
+  N_ln_Real_Elec_P_past_2009 = ln_Real_Elec_P*past_2009,
+  composit_ln_elec_P = N_ln_P_elec_prev_2009 + N_ln_Real_Elec_P_past_2009,
+  N_P_elec_prev_2009 = P_elec*prev_2009,
+  N_Real_Elec_P_past_2009 = Real_Elec_P*past_2009,
+  composit_elec_P = N_P_elec_prev_2009 + N_Real_Elec_P_past_2009
+) %>%
+  left_join(df_T, by="Year")
+```
+
 
 
 ```{r}
@@ -86,6 +125,7 @@ summary(df_diff)
 plot(x = df$Year, y= df$C_elec_by_pop)
 plot(x = df$Year, y= df$Real_GDP_per_cap)
 plot(x = df$Year, y= df$ln_Real_Elec_P)
+plot(x = df$Year, y= df$CPI)
 plot(x = df_diff$Year, y= df_diff$diff_C_elec_by_pop )
 plot(x = df_diff$Year, y= df_diff$diff_Real_GDP_per_cap)
 plot(x = df_diff$Year, y= df_diff$diff_Real_Elec_P)
@@ -257,12 +297,7 @@ Rupture dès 2009 avec une p-value de 0.7%.
 (Aussi valable pour 2010 et 2011)
 
 ## Structural change
-### Create a dummy
-```{r}
-df <- df %>% mutate(past_2009 = ifelse(df$Year > 2009, 1, 0))
 
-df_diff <- df_diff %>% mutate(past_2009 = ifelse(df_diff$Year > 2009, 1, 0))
-```
 
 ### Models + dummy
 
@@ -393,9 +428,10 @@ summary(model_ln_4)
 ```
 Le deuxième modèle semble le meilleur, essayons de le comprendre :
 ### Best model
+####Second Best
 ```{r}
 model <- lm(
-  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P*past_2009,
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P*past_2009 ,
   data = df
 )
 
@@ -410,23 +446,66 @@ En 2008, libéralisation du marché de l'électricité. Pour les industries et l
 
 Aussi le prix qu'on a est lequel ? Parce qu'on dirait que ça n'est pas le prix de l'élec pour les ménages mais bien pour les entreprises comme il semble se dérégulé après 2009.
 
-Mon analyse : avant 2009, la rédulation des prix rend le signal prix faible : pas de variation rapide des prix donc pas d'optimisation par les entreprises sur le prix de l'électricité. L'impact positif des prix sur la consommation est alors un problème d'endogénéité : si le prix augmente la consommation c'est plutôt parce qu'une hausse de la conso => hausse de la demande => besoin de plus d'offre/inciter à moins consomé => hausse des prix de l'élec par le régulateur (à vérifier dans les rapport comment sont justifiées les hausse si possible)
+Mon analyse : avant 2009, la régulation des prix rend le signal prix faible : pas de variation rapide des prix donc pas d'optimisation par les entreprises sur le prix de l'électricité. L'impact positif des prix sur la consommation est alors un problème d'endogénéité : si le prix augmente la consommation c'est plutôt parce qu'une hausse de la conso => hausse de la demande => besoin de plus d'offre/inciter à moins consomé => hausse des prix de l'élec par le régulateur (à vérifier dans les rapport comment sont justifiées les hausse si possible)
+
 
 Après 2009 : dérégulation pour les entreprises donc signal prix plus important et optimisation de la consommation.(explication pas forcément valable à la résolution annuelle). Rupture de l'effet d'endogénéité par l'introduction d'une concurence (endogénéité qui pouvait cammoufler l'effet prix par le passé).
 
-On corrige pour l'endogénéité en enlevant l'effet prix avant 2009 :
 
+Prix régulé en nominal!!!!!!!!!!!
+
+
+Ok donc avant 2008 signal prix basé sur le prix réel car régulé pour tous, baisse de la conso en 2009 lié à (crise de 2008, ou dérégulation) puis ça reprend mais là influence des prix réels car dérégulation partielle du marché.
+
+Nouveau modèle X)
+
+####Best
 ```{r}
-model_past_2009 <- lm(
-  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + past_2009 + ln_Real_Elec_P:past_2009,
+best_model <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P,
   data = df
 )
 
-summary(model_past_2009)
+summary(best_model)
 ```
-ça ne marche pas très bien pour montrer l'effet prix, on conserve le précédent modèle par la suite même si il y a une possible endogénéité.
 
-## Analyse des résidus
+
+YES YES YES YES !
+
+```{r}
+fs <- Fstats(
+ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P,
+data = df
+)
+plot(fs)
+sctest(fs)
+```
+PLus de rupture !
+
+##Intoduction de la variable de température 
+
+```{r}
+model_T <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P + avg_mean_T,
+  data = df
+)
+
+summary(model_T)
+```
+Pas significatif mais dans le bon sens, part faible de chauffage à l'électricité ?
+
+```{r}
+model_T_2010 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P + avg_mean_T,
+  data = filter(df, Year > 2010)
+)
+
+summary(model_T_2010)
+```
+Avec un filtre Year > 2010 significativité à 10%, indique surement un effet d'électrification des chauffage récent, mais pas si important que ça (à interpréter avec les vraies données de chauffage en pologne). J'imagine que la conso d'élec doit être drivé par d'autres facteurs principallement. (Att douteux)
+
+
+## Analyse des résidus pour le second Best
 Une estimastion des moindres carrés ordinaires est non biaisée seulement si les hypothèses sur les résidus sont vérifiées.
 
 ### Normalité des résidus
@@ -455,12 +534,12 @@ shapiro.test(res)
 Le test de Shapiro-Wilk donne une p-value d'environ 98% qui ne permet pas de rejeter l'hypothèse selon laquelle les résidus suivent une distribution normale au seuil de 5%. OK
 
 
-On peut utiliser les erreurs robustes standards qui corrige la non-normalité et l'hétéroscédasticité (pas nécessaire)
+On peut utiliser les erreurs robustes standards qui corrige la non-normalité et l'hétéroscédasticité (Pas nécessaire mais bonne pratique)
 
 ```{r}
 coeftest(model, vcov = vcovHC(model, type = "HC1"))
 ```
-Cela améliore les résultats
+(à vérifier mais améliore potentiellement les résul)
 
 ### Autocorrélation des résidus
 Si il y a de l'autocorrélation des résidus, l'estimation des moindres carrés reste sans biais mais est inefficace et fausse les erreurs standards des coefficients et biaise les tests (t-tests et F-tests) avec des intervalles de confiance trop étroits. Il y a donc un risque de faux-positif (variable faussement considérée comme significative).
@@ -560,6 +639,421 @@ validationplot(pcr_model, val.type = "MSEP")  # mean squared error
 
 ```
 
-## Bootstrap
+## Bootstrap second best 
+
+```{r}
+library(boot)
+
+boot_path_elec <- function(data, indices) {
+  
+  d <- data[indices, ]
+  
+  fit <- try(
+    lm(
+      ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P * past_2009,
+      data = d
+    ),
+    silent = TRUE
+  )
+  
+  if (inherits(fit, "try-error"))
+    return(rep(NA, nrow(data)))
+  
+  # Predicted log consumption using ORIGINAL regressors
+  ln_hat <- predict(fit, newdata = data)
+  
+  return(ln_hat)
+}
+
+
+set.seed(123)
+
+boot_res <- boot(
+  data = df,
+  statistic = boot_path_elec,
+  R = 1000
+)
+
+boot_mat <- boot_res$t
+boot_mat <- boot_mat[complete.cases(boot_mat), ]
+
+fan <- apply(
+  boot_mat,
+  2,
+  quantile,
+  probs = c(0.05, 0.5, 0.95)
+)
+
+fan <- t(fan)
+colnames(fan) <- c("lower", "median", "upper")
+
+fan_level <- exp(fan)
+obs_level <- exp(df$ln_C_elec_by_pop)
+years <- df$Year
+
+```
+
+```{r}
+library(ggplot2)
+
+df_fan <- data.frame(
+  year   = years,
+  lower  = fan_level[, "lower"],
+  median = fan_level[, "median"],
+  upper  = fan_level[, "upper"]
+)
+
+df_obs <- data.frame(
+  year = years,
+  obs  = obs_level
+)
+
+p_fan <- ggplot() +
+  
+  # 90% Confidence band
+  geom_ribbon(
+    data = df_fan,
+    aes(x = year, ymin = lower, ymax = upper, fill = "90% CI"),
+    alpha = 0.25
+  ) +
+  
+  # Median bootstrap path
+  geom_line(
+    data = df_fan,
+    aes(x = year, y = median, color = "Median bootstrap"),
+    linewidth = 1.2
+  ) +
+  
+  # Observed data
+  geom_point(
+    data = df_obs,
+    aes(x = year, y = obs, color = "Observed"),
+    size = 2
+  ) +
+  
+  labs(
+    title = "Bootstrap Fan Chart: Electricity Consumption per Capita",
+    x = "Year",
+    y = "Electricity consumption per capita",
+    color = "",
+    fill  = ""
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Observed" = "black",
+      "Median bootstrap" = "#1f78b4"
+    )
+  ) +
+  
+  scale_fill_manual(
+    values = c("90% CI" = "#1f78b4")
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+ggsave(
+  filename = "fan_chart_bootstrap_electricity.pdf",
+  plot = p_fan,
+  width = 8,
+  height = 5
+)
+```
+
+#best_model analysis
+
+```{r}
+model <- best_model
+```
+
+Une estimastion des moindres carrés ordinaires est non biaisée seulement si les hypothèses sur les résidus sont vérifiées.
+
+### Normalité des résidus
+
+Théorie :
+La normalité est nécessaire pour : 
+- Des t-tests valides
+- Des F-tests valides lorsqu'il y a peu d'échantillons
+
+Tests:
+- Graphique: QQ-plot
+- Statistique: Shapiro-Wilk / Jarque-Bera
+
+```{r}
+res <- residuals(model)
+
+qqnorm(res)
+qqline(res, col = "red")
+
+mean(res)
+skewness(res)
+kurtosis(res)
+
+shapiro.test(res)
+```
+Le test de Shapiro-Wilk donne une p-value d'environ 58% qui ne permet pas de rejeter l'hypothèse selon laquelle les résidus suivent une distribution normale au seuil de 5%. OK
+
+
+On peut utiliser les erreurs robustes standards qui corrige la non-normalité et l'hétéroscédasticité (Pas nécessaire mais bonne pratique)
+
+```{r}
+coeftest(model, vcov = vcovHC(model, type = "HC1"))
+```
+(à vérifier mais améliore potentiellement les résul)
+
+### Autocorrélation des résidus
+Si il y a de l'autocorrélation des résidus, l'estimation des moindres carrés reste sans biais mais est inefficace et fausse les erreurs standards des coefficients et biaise les tests (t-tests et F-tests) avec des intervalles de confiance trop étroits. Il y a donc un risque de faux-positif (variable faussement considérée comme significative).
+```{r}
+dwtest(model)
+pacf(res)
+Box.test(res, lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
+plot(model, which = 1)  # Résidus vs valeurs ajustées, pas d'infos évidentes
+```
+On rejète l'hypothèse delon laquelle l'autocorrélation des résidus est nulle au seuil de 5% (pvalue sur DW 1.5% NOOOOOOOOOOOOOOOO)
+
+
+```{r}
+acf(residuals(model))
+```
+
+Y a grave un lag de 1
+
+
+
+
+##Correction best model
+
+Je n'ai pas ajouté le lag car pas significatif, corrige pas super bien l'autocorré  ET créé de l'hétéroscédasticité.
+
+```{r}
+coeftest(model, vcov = NeweyWest(model, lag = 1)) A garder comme ça 
+```
+
+
+### Hétéroscédasticité
+
+Important pour la validité des tests.
+Ici on tests si le carré des résidus est lié aux variables explicatives (ou à leurs carrés aussi).
+```{r}
+bptest(model)
+bptest(model, ~ ln_Real_GDP_per_cap + composit_ln_elec_P + 
+         I(ln_Real_GDP_per_cap^2) + I(composit_ln_elec_P^2),
+       data = df)
+```
+Des p-value qui ne rejette pas l'hypothèse l'homoscédasticité sous un seuil de 5% ! On est tt bon !
+
+## Multicolinéarité des variables explicatives
+
+### Corrélation
+Si on a une forte corrélation entre les varibales explicatives, la variance des estimateurs est accrue.
+
+```{r}
+df <- df[-1,]
+correlation <- cor(df[, c("ln_Real_GDP_per_cap", "composit_ln_elec_P")])
+corrplot(cor(df[, c("ln_Real_GDP_per_cap", "composit_ln_elec_P")]))
+correlation
+```
+
+### VIF
+
+```{r}
+vif(model)
+
+vif(model, type = "predictor")
+```
+Pas de forte colinéarité pour ln_Real_GDP_per_cap et composit_ln_elec_P (<5).
+
+
+
+### Solutions à la multicolinéarité (inutiles dans notre cas)
+#### Régression de Ridge
+
+```{r}
+# Make sure the model matrix uses the same cleaned data as your y
+df_clean <- na.omit(df[, c("ln_C_elec_by_pop", "ln_Real_GDP_per_cap", "composit_ln_elec_P")])
+
+X <- model.matrix(ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P, data = df_clean)[, -1]
+y <- df_clean$ln_C_elec_by_pop
+
+# Check dimensions
+dim(X)       # should be 33 x p
+length(y)    # should be 33
+
+```
+
+
+```{r}
+
+ridge <- glmnet(X, y, alpha = 0) #alpha = 0 pour ridge (vers 1 c'est lasso)
+summary(ridge) 
+plot(ridge, xvar = "lambda", label = TRUE)
+```
+#### Régression en composante principale
+```{r}
+# Install if needed
+# install.packages("pls")
+library(pls)
+
+# PCR: regress ln_C_elec_by_pop on predictors
+pcr_model <- pcr(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P,
+  data = df_clean,
+  scale = TRUE,   # standardize predictors
+  validation = "CV"  # cross-validation to choose # of components
+)
+
+# Summary
+summary(pcr_model)
+
+
+# Choose optimal number of components using CV
+validationplot(pcr_model, val.type = "MSEP")  # mean squared error
+
+```
+
+## Bootstrap best 
+
+```{r}
+library(boot)
+
+boot_path_elec <- function(data, indices) {
+  
+  d <- data[indices, ]
+  
+  fit <- try(
+    lm(
+      ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P,
+      data = d
+    ),
+    silent = TRUE
+  )
+  
+  if (inherits(fit, "try-error"))
+    return(rep(NA, nrow(data)))
+  
+  # Predicted log consumption using ORIGINAL regressors
+  ln_hat <- predict(fit, newdata = data)
+  
+  return(ln_hat)
+}
+
+
+set.seed(123)
+
+boot_res <- boot(
+  data = df,
+  statistic = boot_path_elec,
+  R = 1000
+)
+
+boot_mat <- boot_res$t
+boot_mat <- boot_mat[complete.cases(boot_mat), ]
+
+fan <- apply(
+  boot_mat,
+  2,
+  quantile,
+  probs = c(0.05, 0.5, 0.95)
+)
+
+fan <- t(fan)
+colnames(fan) <- c("lower", "median", "upper")
+
+fan_level <- exp(fan)
+obs_level <- exp(df$ln_C_elec_by_pop)
+years <- df$Year
+
+```
+
+```{r}
+library(ggplot2)
+
+df_fan <- data.frame(
+  year   = years,
+  lower  = fan_level[, "lower"],
+  median = fan_level[, "median"],
+  upper  = fan_level[, "upper"]
+)
+
+df_obs <- data.frame(
+  year = years,
+  obs  = obs_level
+)
+
+p_fan <- ggplot() +
+  
+  # 90% Confidence band
+  geom_ribbon(
+    data = df_fan,
+    aes(x = year, ymin = lower, ymax = upper, fill = "90% CI"),
+    alpha = 0.25
+  ) +
+  
+  # Median bootstrap path
+  geom_line(
+    data = df_fan,
+    aes(x = year, y = median, color = "Median bootstrap"),
+    linewidth = 1.2
+  ) +
+  
+  # Observed data
+  geom_point(
+    data = df_obs,
+    aes(x = year, y = obs, color = "Observed"),
+    size = 2
+  ) +
+  
+  labs(
+    title = "Bootstrap Fan Chart: Electricity Consumption per Capita",
+    x = "Year",
+    y = "Electricity consumption per capita",
+    color = "",
+    fill  = ""
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Observed" = "black",
+      "Median bootstrap" = "#1f78b4"
+    )
+  ) +
+  
+  scale_fill_manual(
+    values = c("90% CI" = "#1f78b4")
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+ggsave(
+  filename = "fan_chart_bootstrap_electricity_best.pdf",
+  plot = p_fan,
+  width = 8,
+  height = 5
+)
+```
+
+
+## To do electric model
+```{r}
+
+```
 
 
