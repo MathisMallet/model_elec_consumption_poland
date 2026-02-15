@@ -34,6 +34,7 @@ library(glmnet)
 library(strucchange)
 library(pls)
 library(aTSA)
+library(data.table)
 ```
 
 ## Importation des données
@@ -84,6 +85,7 @@ df <- df %>%
   ln_Year = log(Year),
   lag_ln_C_elec_by_pop = lag(ln_C_elec_by_pop))
 df <- df[-nrow(df), ]
+
 
 summary(df)
 ```
@@ -1051,9 +1053,503 @@ ggsave(
 ```
 
 
-## To do electric model
+# electric price model
+## Imports
 ```{r}
+library(readxl)
+df_energy_path = "WorldEnergyBalancesHighlights2025.xlsx"
+df_energy_raw <- read_excel(df_energy_path, sheet="TimeSeries_1971-2024", skip=1)
+```
+
+## Transform
+
+```{r}
+df_energy <- df_energy_raw %>% 
+  filter(Country == "Poland") %>%
+  filter(Flow == "Total energy supply (PJ)") %>%
+  filter(Product =="Renewables and waste" | Product =="Total") %>%
+  select(-c("Country", "Flow", "NoCountry", "NoFlow", "NoProduct"))
+
+df_energy <- rbind(colnames(df_energy), df_energy) %>%
+  transpose()
+
+colnames(df_energy) <- as.character(df_energy[1, ])
+df_energy <- df_energy[-1,]
+rownames(df_energy) <- NULL
+df_energy <- rename_at(df_energy, "Product", ~"Year")
+df_energy <- rename_at(df_energy, "Renewables and waste", ~"Renewables_and_waste")
+df_energy <- df_energy %>%
+  mutate_all(as.numeric) %>%
+  mutate(REshare = Renewables_and_waste / Total)
+
+summary(df_energy)
 
 ```
 
+```{r}
+df_full <- df %>%
+  left_join(df_energy, by = "Year") %>%
+  mutate(lag_composit_ln_elec_P = lag(composit_ln_elec_P))
+```
+
+## First elec price models
+
+```{r}
+model_P_1 <- lm(
+  composit_ln_elec_P ~ REshare ,
+  data = filter(df_full, Year > 2009)
+)
+
+summary(model_P_1)
+
+model_P_2 <- lm(
+  composit_ln_elec_P ~ REshare + lag_composit_ln_elec_P,
+  data = filter(df_full, Year > 2010)
+)
+
+summary(model_P_2)
+
+model <- model_P_1
+
+```
+### Normalité des résidus
+
+Théorie :
+La normalité est nécessaire pour : 
+- Des t-tests valides
+- Des F-tests valides lorsqu'il y a peu d'échantillons
+
+Tests:
+- Graphique: QQ-plot
+- Statistique: Shapiro-Wilk / Jarque-Bera
+
+```{r}
+res <- residuals(model)
+
+qqnorm(res)
+qqline(res, col = "red")
+
+mean(res)
+skewness(res)
+kurtosis(res)
+
+shapiro.test(res)
+```
+Le test de Shapiro-Wilk donne une p-value d'environ 4.8% qui ne permet pas de conserver l'hypothèse selon laquelle les résidus suivent une distribution normale au seuil de 5%. OK
+
+
+On peut utiliser les erreurs robustes standards qui corrige la non-normalité et l'hétéroscédasticité (Pas nécessaire mais bonne pratique)
+
+```{r}
+coeftest(model, vcov = vcovHC(model, type = "HC1"))
+```
+(à vérifier mais améliore potentiellement les résultats)
+
+### Autocorrélation des résidus
+Si il y a de l'autocorrélation des résidus, l'estimation des moindres carrés reste sans biais mais est inefficace et fausse les erreurs standards des coefficients et biaise les tests (t-tests et F-tests) avec des intervalles de confiance trop étroits. Il y a donc un risque de faux-positif (variable faussement considérée comme significative).
+```{r}
+dwtest(model)
+pacf(res)
+Box.test(res, lag = 1, type = c("Box-Pierce", "Ljung-Box"), fitdf = 0)
+plot(model, which = 1)  # Résidus vs valeurs ajustées, pas d'infos évidentes
+```
+On conserve l'hypothèse delon laquelle l'autocorrélation des résidus est nulle au seuil de 5% (pvalue sur DW 23%)
+
+
+### Hétéroscédasticité
+
+Important pour la validité des tests.
+Ici on tests si le carré des résidus est lié aux variables explicatives (ou à leurs carrés aussi).
+```{r}
+bptest(model)
+bptest(model, ~ ln_Real_GDP_per_cap + composit_ln_elec_P + 
+         I(ln_Real_GDP_per_cap^2) + I(composit_ln_elec_P^2),
+       data = df)
+```
+Des p-value qui ne rejette pas l'hypothèse l'homoscédasticité sous un seuil de 5% ! On est tt bon !
+
+Pas besoin de tester pour multicolinéarité puisqu'une seule variable
+
+### Bootstrap élec price model
+
+```{r}
+library(boot)
+library(dplyr)
+
+df_model <- df_full %>% 
+  filter(Year > 2009)
+
+boot_path_P1 <- function(data, indices) {
+  
+  d <- data[indices, ]
+  
+  fit <- try(
+    lm(
+      composit_ln_elec_P ~ REshare,
+      data = d
+    ),
+    silent = TRUE
+  )
+  
+  if (inherits(fit, "try-error"))
+    return(rep(NA, nrow(data)))
+  
+  # Predicted log price using ORIGINAL regressors
+  ln_hat <- predict(fit, newdata = data)
+  
+  return(ln_hat)
+}
+
+set.seed(123)
+
+boot_res <- boot(
+  data = df_model,
+  statistic = boot_path_P1,
+  R = 1000
+)
+
+boot_mat <- boot_res$t
+boot_mat <- boot_mat[complete.cases(boot_mat), ]
+
+fan <- apply(
+  boot_mat,
+  2,
+  quantile,
+  probs = c(0.05, 0.5, 0.95)
+)
+
+fan <- t(fan)
+colnames(fan) <- c("lower", "median", "upper")
+
+fan_level <- exp(fan)
+obs_level <- exp(df_model$composit_ln_elec_P)
+years <- df_model$Year
+
+```
+
+```{r}
+
+df_fan <- data.frame(
+  year   = years,
+  lower  = fan_level[, "lower"],
+  median = fan_level[, "median"],
+  upper  = fan_level[, "upper"]
+)
+
+df_obs <- data.frame(
+  year = years,
+  obs  = obs_level
+)
+
+p_fan <- ggplot() +
+  
+  geom_ribbon(
+    data = df_fan,
+    aes(x = year, ymin = lower, ymax = upper, fill = "90% CI"),
+    alpha = 0.25
+  ) +
+  
+  geom_line(
+    data = df_fan,
+    aes(x = year, y = median, color = "Median bootstrap"),
+    linewidth = 1.2
+  ) +
+  
+  geom_point(
+    data = df_obs,
+    aes(x = year, y = obs, color = "Observed"),
+    size = 2
+  ) +
+  
+  labs(
+    title = "Bootstrap Fan Chart: Electricity Price Index",
+    x = "Year",
+    y = "Electricity price index (level)",
+    color = "",
+    fill  = ""
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Observed" = "black",
+      "Median bootstrap" = "#1f78b4"
+    )
+  ) +
+  
+  scale_fill_manual(
+    values = c("90% CI" = "#1f78b4")
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+ggsave(
+  filename = "fan_chart_bootstrap_price_REshare.pdf",
+  plot = p_fan,
+  width = 8,
+  height = 5
+)
+
+```
+
+
+
+## Combined bootstrap
+### Trajectory
+
+https://www.oecd.org/fr/publications/perspectives-economiques-de-l-ocde-volume-2025-numero-2_62298503-fr/full-report/poland_eefa15ca.html#indicator-d1e9631-5f6bcac8ee on arrondit à 3% de croissance jusqu'à 2030
++ doc de la commission, on monte à 30% d'ER en 2030 linéairement, on est à 15% pour l'instant, 2024 - 2030 ça fait 7 ans, donc 15/7 = 2.15% par an en moyenne.
+On obtient ainsi notre trajectoire simplifiée.
+
+
+```{r}
+df_traj_RE <- df_full
+for (year in c(2024:2030)){
+  last_row <- tail(df_traj_RE, n=1)
+  last_row <- last_row %>% mutate(across(
+    .cols = -c(REshare, ln_Real_GDP_per_cap),
+    .fns  = ~ NaN
+  ))
+  last_row$Year = year 
+  last_row$ln_Real_GDP_per_cap = last_row$ln_Real_GDP_per_cap + log(1.03)
+  last_row$REshare = last_row$REshare + 0.0215
+  df_traj_RE <- rbind(df_traj_RE, last_row)
+}
+
+df_traj_RE <- filter(df_traj_RE, Year > 2022)
+```
+
+### Bootpath
+
+
+#### full joint boot
+
+```{r}
+library(boot)
+
+joint_energy_boot <- function(data, indices, traj){
+
+  d <- data[indices, ]
+
+  # -------- PRICE MODEL --------
+  price_fit <- try(
+    lm(composit_ln_elec_P ~ REshare,
+       data = d[d$Year > 2009, ]),
+    silent = TRUE
+  )
+
+  if(inherits(price_fit,"try-error"))
+    return(rep(NA, nrow(traj)))
+
+  # -------- DEMAND MODEL --------
+  demand_fit <- try(
+    lm(ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P,
+       data = d),
+    silent = TRUE
+  )
+
+  if(inherits(demand_fit,"try-error"))
+    return(rep(NA, nrow(traj)))
+
+  # -------- DYNAMIC SIMULATION --------
+  H <- nrow(traj)
+
+  ln_price_hat <- numeric(H)
+  ln_cons_hat  <- numeric(H)
+
+  for(h in 1:H){
+
+    # 1) predict electricity price
+    ln_price_hat[h] <- predict(
+      price_fit,
+      newdata = data.frame(REshare = traj$REshare[h])
+    )
+
+    # 2) predict electricity consumption
+    ln_cons_hat[h] <- predict(
+      demand_fit,
+      newdata = data.frame(
+        ln_Real_GDP_per_cap = traj$ln_Real_GDP_per_cap[h],
+        composit_ln_elec_P  = ln_price_hat[h]
+      )
+    )
+  }
+
+  return(cbind(price = ln_price_hat,
+               consumption = ln_cons_hat))
+}
+
+```
+
+```{r}
+set.seed(123)
+
+boot_res <- boot(
+  data = df_full,
+  statistic = joint_energy_boot,
+  R = 1000,
+  traj = df_traj_RE
+)
+
+
+```
+
+```{r}
+boot_mat <- boot_res$t
+boot_mat <- boot_mat[complete.cases(boot_mat), , drop = FALSE]
+
+H <- nrow(df_traj_RE)
+
+price_idx <- 1:H
+cons_idx  <- (H+1):(2*H)
+
+fan_price <- t(apply(boot_mat[, price_idx], 2, quantile, probs=c(0.05,0.5,0.95)))
+fan_cons  <- t(apply(boot_mat[, cons_idx], 2, quantile, probs=c(0.05,0.5,0.95)))
+
+colnames(fan_price) <- colnames(fan_cons) <- c("lower","median","upper")
+
+# convert from logs
+fan_price_lvl <- exp(fan_price)
+fan_cons_lvl  <- exp(fan_cons)
+
+years <- df_traj_RE$Year
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Fonction réutilisable pour tracer un fan chart avec ggplot2
+plot_fan_gg <- function(fan, hist_data, hist_years, forecast_years, ylab_title,
+                        col_med = "#1f78b4", col_fan = rgb(0.2, 0.4, 0.8, 0.25), filename) {
+
+  # Données historiques
+  df_hist <- data.frame(
+    year = hist_years,
+    value = hist_data
+  )
+
+  # Données de prévision
+  df_forecast <- data.frame(
+    year = forecast_years,
+    lower = fan[, "lower"],
+    median = fan[, "median"],
+    upper = fan[, "upper"]
+  )
+
+  # Graphique de base
+  p <- ggplot() +
+    # Bande de confiance (90 %)
+    geom_ribbon(
+      data = df_forecast,
+      aes(x = year, ymin = lower, ymax = upper, fill = "Intervalle de confiance à 90 %"),
+      alpha = 0.25
+    ) +
+    # Trajectoire médiane
+    geom_line(
+      data = df_forecast,
+      aes(x = year, y = median, color = "Trajectoire médiane (bootstrap)"),
+      linewidth = 1.2
+    ) +
+    # Données historiques
+    geom_point(
+      data = df_hist,
+      aes(x = year, y = value, color = "Données observées"),
+      size = 2
+    ) +
+    # Échelles de couleur et de remplissage
+    scale_color_manual(
+      values = c(
+        "Données observées" = "black",
+        "Trajectoire médiane (bootstrap)" = col_med
+      )
+    ) +
+    scale_fill_manual(
+      values = c("Intervalle de confiance à 90 %" = col_fan)
+    ) +
+    # Titres et labels
+    labs(
+      x = "Année",
+      y = ylab_title,
+      color = "",
+      fill = "",
+      title = paste("Fan chart bootstrap des", ylab_title)
+    ) +
+    # Thème
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "top",
+      legend.direction = "horizontal",
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      panel.grid.minor = element_blank()
+    )
+
+  # Sauvegarder le graphique
+  ggsave(
+    filename = filename,
+    plot = p,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+}
+
+
+```
+
+
+```{r}
+# Historical sample consistent with estimation window
+hist_price_data <- df_full[df_full$Year > 2009, ]
+
+hist_years_price <- hist_price_data$Year
+hist_price <- exp(hist_price_data$composit_ln_elec_P)
+
+# Forecast years (unchanged)
+forecast_years <- df_traj_RE$Year
+
+
+```
+
+
+```{r}
+plot_fan_gg(
+  fan = fan_price_lvl,
+  hist_data = hist_price,
+  hist_years = hist_years_price,
+  forecast_years = forecast_years,
+  ylab_title = "Indice de prix de l’électricité",
+  filename = "fan_chart_price_REshare.pdf"
+)
+
+
+```
+
+```{r}
+hist_cons_data <- df_full
+
+hist_years_cons <- hist_cons_data$Year
+hist_cons <- exp(hist_cons_data$ln_C_elec_by_pop)
+
+plot_fan_gg(
+  fan = fan_cons_lvl,
+  hist_data = hist_cons,
+  hist_years = hist_years_cons,
+  forecast_years = forecast_years,
+  ylab_title = "Consommation d’électricité par habitant",
+  col_med = "red",
+  col_fan = rgb(0.8,0.2,0.2,0.25),
+  filename = "fan_chart_consumption_REshare.pdf"
+)
+
+```
 
