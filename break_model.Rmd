@@ -35,6 +35,7 @@ library(strucchange)
 library(pls)
 library(aTSA)
 library(data.table)
+
 ```
 
 ## Importation des données
@@ -429,7 +430,7 @@ summary(model_ln_4)
 
 ```
 Le deuxième modèle semble le meilleur, essayons de le comprendre :
-### Best model
+### Best models
 ####Second Best
 ```{r}
 model <- lm(
@@ -1549,6 +1550,179 @@ plot_fan_gg(
   col_med = "red",
   col_fan = rgb(0.8,0.2,0.2,0.25),
   filename = "fan_chart_consumption_REshare.pdf"
+)
+
+```
+
+# Formating econometrics tabs
+## Structural break model
+```{r}
+library(texreg)
+
+d1 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap,
+  data = df
+)
+
+d2 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+  data = df
+)
+
+d3 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P + past_2009,
+  data = df
+)
+
+d4 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P*past_2009,
+  data = df
+)
+
+summary(d4)
+
+
+```
+
+```{r}
+texreg(
+  list(d1, d2, d3, d4),
+
+  custom.coef.map = list(
+    "(Intercept)" = "Constante",
+    "ln_Real_GDP_per_cap" = "PIB réel par habitant (log)",
+    "ln_Real_Elec_P" = "Prix réel de l’électricité (log)",
+    "past_2009" = "Rupture structurelle après 2009",
+    "ln_Real_Elec_P:past_2009" = "Élasticité prix après 2009"
+  ),
+
+  custom.model.names = c(
+    "PIB seul",
+    "+ Prix",
+    "+ Dummy 2009",
+    "+ Interaction"
+  ),
+
+  caption = "Demande d’électricité avec rupture structurelle",
+  label = "tab:elec_demand_break",
+  stars = c(0.01, 0.05, 0.1),
+  booktabs = TRUE,
+  dcolumn = FALSE,
+  use.packages = FALSE
+)
+
+```
+## composit price model
+
+```{r}
+b1 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap,
+  data = df
+)
+
+b2 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_Real_Elec_P,
+  data = df
+)
+
+b3 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + ln_P_elec,
+  data = df
+)
+
+b4 <- lm(
+  ln_C_elec_by_pop ~ ln_Real_GDP_per_cap + composit_ln_elec_P,
+  data = df
+)
+
+summary(b4)
+
+```
+
+```{r}
+# b4 OLS classique
+b4_ols <- b4
+
+# b4 Newey-West lag 1
+nw_vcov_b4 <- NeweyWest(b4, lag = 1, prewhite = FALSE)
+nw_se_b4   <- sqrt(diag(nw_vcov_b4))
+nw_p_b4    <- coeftest(b4, vcov = nw_vcov_b4)[,4]
+
+# Créer un "dummy model" pour texreg avec mêmes coefficients mais SE NW
+b4_nw <- b4
+```
+
+
+```{r}
+texreg(
+  list(b1, b2, b3, b4_ols, b4_nw),
+
+  # Remplacer SE et p-values seulement pour le NW
+  override.se = list(
+    NULL, NULL, NULL, NULL, nw_se_b4
+  ),
+  override.pvalues = list(
+    NULL, NULL, NULL, NULL, nw_p_b4
+  ),
+
+  custom.coef.map = list(
+    "(Intercept)" = "Constante",
+    "ln_Real_GDP_per_cap" = "PIB réel par habitant (log)",
+    "ln_Real_Elec_P" = "Prix réel de l’électricité (log)",
+    "ln_P_elec" = "Prix nominal de l’électricité (log)",
+    "composit_ln_elec_P" = "Indice composite du prix de l’électricité"
+  ),
+
+  custom.model.names = c(
+    "PIB seul",
+    "Prix réel",
+    "Prix nominal",
+    "Indice composite (OLS)",
+    "Indice composite (NW lag 1)"
+  ),
+
+  custom.note = "Le dernier modèle est présenté avec et sans correction Newey-West (lag 1).",
+
+  caption = "Comparaison des mesures de prix dans la demande d’électricité",
+  label = "tab:elec_price_measures",
+  stars = c(0.01, 0.05, 0.1),
+  booktabs = TRUE,
+  dcolumn = FALSE,
+  use.packages = FALSE,
+  digits = 3
+)
+
+
+```
+
+## modèle d'influence du renouvelable sur le prix de l'élec
+```{r}
+p1 <- lm(
+  composit_ln_elec_P ~ REshare,
+  data = filter(df_full, Year > 2009)
+)
+
+summary(p1)
+
+```
+
+```{r}
+texreg(
+  list(p1),
+
+  custom.coef.map = list(
+    "(Intercept)" = "Constante",
+    "REshare" = "Part des renouvelables"
+  ),
+
+  custom.model.names = c("Prix de l’électricité"),
+
+  caption = "Formation du prix de l’électricité : effet des renouvelables",
+  label = "tab:price_formation_RE",
+  stars = c(0.01, 0.05, 0.1),
+  booktabs = TRUE,
+  dcolumn = FALSE,
+  use.packages = FALSE
 )
 
 ```
